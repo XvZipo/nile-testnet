@@ -1052,7 +1052,8 @@ public class ProposalUtilTest extends BaseTest {
         ForkBlockVersionEnum.VERSION_4_8_3_PQ1.getValue());
     // The previous hard fork stays strictly below the advertised block version.
     Assert.assertTrue("VERSION_4_8_2_4_PQ1 must be below BLOCK_VERSION",
-        ForkBlockVersionEnum.VERSION_4_8_2_4_PQ1.getValue() < Parameter.ChainConstant.BLOCK_VERSION);
+        ForkBlockVersionEnum.VERSION_4_8_2_4_PQ1.getValue()
+            < Parameter.ChainConstant.BLOCK_VERSION);
   }
 
   @Test

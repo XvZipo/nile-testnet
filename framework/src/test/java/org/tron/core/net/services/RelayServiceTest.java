@@ -551,7 +551,8 @@ public class RelayServiceTest extends BaseTest {
 
       // Derived PQ address does not match the claimed witness address → reject.
       FNDSA512 strayKeypair = new FNDSA512();
-      byte[] strayDigest = Sha256Hash.of(ByteArray.fromLong(helloMessage.getTimestamp())).getBytes();
+      byte[] strayDigest = Sha256Hash.of(
+          ByteArray.fromLong(helloMessage.getTimestamp())).getBytes();
       byte[] straySig = FNDSA512.sign(strayKeypair.getPrivateKey(), strayDigest);
       helloMessage.setHelloMessage(base.toBuilder()
           .setPqAuthSig(PQAuthSig.newBuilder()
