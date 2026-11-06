@@ -24,16 +24,19 @@ public class NileForkVersionTest {
         ForkBlockVersionEnum.getForkBlockVersionEnum(38));
     assertSame(ForkBlockVersionEnum.VERSION_4_8_2_3_PQ1,
         ForkBlockVersionEnum.getForkBlockVersionEnum(39));
+    assertSame(ForkBlockVersionEnum.VERSION_4_8_2_4_PQ1,
+        ForkBlockVersionEnum.getForkBlockVersionEnum(40));
   }
 
   @Test
   public void newForkUsesNextNileBlockVersion() {
-    ForkBlockVersionEnum fork = ForkBlockVersionEnum.valueOf("VERSION_4_8_2_4_PQ1");
-    assertEquals(40, fork.getValue());
-    assertEquals(40, ChainConstant.BLOCK_VERSION);
+    ForkBlockVersionEnum fork = ForkBlockVersionEnum.valueOf("VERSION_4_8_3_PQ1");
+    assertEquals(41, fork.getValue());
+    assertEquals(41, ChainConstant.BLOCK_VERSION);
     assertSame(fork, ForkBlockVersionEnum.getForkBlockVersionEnum(ChainConstant.BLOCK_VERSION));
-    assertEquals(ForkBlockVersionEnum.VERSION_4_8_2_3_PQ1.getHardForkTime(), fork.getHardForkTime());
-    assertEquals(70, fork.getHardForkRate());
+    assertEquals(ForkBlockVersionEnum.VERSION_4_8_2_4_PQ1.getHardForkTime(),
+        fork.getHardForkTime());
+    assertEquals(80, fork.getHardForkRate());
   }
 
   @Test

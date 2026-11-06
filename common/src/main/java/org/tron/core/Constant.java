@@ -58,9 +58,6 @@ public class Constant {
   public static final String MARKET_PAIR_PRICE_TO_ORDER = "market_pair_price_to_order";
   public static final String ROCKSDB = "ROCKSDB";
 
-  // Crypto engine
-  public static final String ECKey_ENGINE = "ECKey";
-
   // Account permission
   // 0=owner, 1=witness, 2-9=active (up to 8 active permissions)
   public static final int MAX_ACTIVE_PERMISSION_CNT = 8;

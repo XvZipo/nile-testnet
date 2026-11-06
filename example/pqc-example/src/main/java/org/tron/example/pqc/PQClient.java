@@ -85,8 +85,7 @@ public class PQClient {
       Block head = stub.getNowBlock(EmptyMessage.getDefaultInstance());
       byte[] headerRaw = head.getBlockHeader().getRawData().toByteArray();
       long   refNum    = head.getBlockHeader().getRawData().getNumber();
-      byte[] blockHash = Sha256Hash.of(
-          CommonParameter.getInstance().isECKeyCryptoEngine(), headerRaw).getBytes();
+      byte[] blockHash = Sha256Hash.of(headerRaw).getBytes();
 
       System.out.println("Reference block: #" + refNum
           + " hash=" + ByteArray.toHexString(Arrays.copyOfRange(blockHash, 0, 8)) + "...");
@@ -110,9 +109,7 @@ public class PQClient {
       Transaction tx = Transaction.newBuilder().setRawData(rawData).build();
 
       // ── 5. Sign with selected PQ scheme ─────────────────────────────────
-      byte[] txId   = Sha256Hash.of(
-          CommonParameter.getInstance().isECKeyCryptoEngine(),
-          rawData.toByteArray()).getBytes();
+      byte[] txId   = Sha256Hash.of(rawData.toByteArray()).getBytes();
       byte[] sig    = userKp.sign(txId);
 
       // Producers must set the scheme tag explicitly; scheme=0

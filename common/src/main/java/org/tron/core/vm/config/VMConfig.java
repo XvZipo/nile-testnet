@@ -8,8 +8,6 @@ import org.tron.common.parameter.CommonParameter;
  */
 public class VMConfig {
 
-  private static boolean vmTraceCompressed = false;
-
   @Setter
   private static boolean vmTrace = false;
 
@@ -48,6 +46,7 @@ public class VMConfig {
     public boolean allowHardenResourceCalculation;
     public boolean allowFnDsa512;
     public boolean allowMlDsa44;
+    public boolean allowStrictEcdsaValidation;
     public boolean allowOptimizeTvmStorageKey;
   }
 
@@ -90,10 +89,6 @@ public class VMConfig {
 
   public static boolean vmTrace() {
     return vmTrace;
-  }
-
-  public static boolean vmTraceCompressed() {
-    return vmTraceCompressed;
   }
 
   public static void initVmHardFork(boolean pass) {
@@ -219,6 +214,10 @@ public class VMConfig {
     globalSnapshot.allowOptimizeTvmStorageKey = allow == 1;
   }
 
+  public static void initAllowStrictEcdsaValidation(long allow) {
+    globalSnapshot.allowStrictEcdsaValidation = allow == 1;
+  }
+
   public static boolean getEnergyLimitHardFork() {
     return CommonParameter.ENERGY_LIMIT_HARD_FORK;
   }
@@ -337,5 +336,9 @@ public class VMConfig {
 
   public static boolean allowOptimizeTvmStorageKey() {
     return current().allowOptimizeTvmStorageKey;
+  }
+
+  public static boolean allowStrictEcdsaValidation() {
+    return current().allowStrictEcdsaValidation;
   }
 }

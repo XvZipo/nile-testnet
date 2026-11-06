@@ -4,6 +4,10 @@ import static org.mockito.Mockito.mock;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
 
 import org.junit.AfterClass;
 import org.junit.Assert;
@@ -15,6 +19,7 @@ import org.mockito.Mockito;
 import org.springframework.context.ApplicationContext;
 import org.tron.common.TestConstants;
 import org.tron.common.application.TronApplicationContext;
+import org.tron.common.overlay.message.Message;
 import org.tron.common.parameter.CommonParameter;
 import org.tron.common.utils.ReflectUtils;
 import org.tron.common.utils.Sha256Hash;
@@ -22,7 +27,10 @@ import org.tron.core.capsule.BlockCapsule;
 import org.tron.core.config.DefaultConfig;
 import org.tron.core.config.args.Args;
 import org.tron.core.net.P2pEventHandlerImpl;
+import org.tron.core.net.TronNetDelegate;
 import org.tron.core.net.message.adv.BlockMessage;
+import org.tron.core.net.message.adv.FetchInvDataMessage;
+import org.tron.core.net.message.adv.InventoryMessage;
 import org.tron.core.net.message.adv.TransactionMessage;
 import org.tron.core.net.peer.Item;
 import org.tron.core.net.peer.PeerConnection;
@@ -61,7 +69,7 @@ public class AdvServiceTest {
   }
 
   @Test
-  public void test() {
+  public void test() throws IOException {
     testAddInv();
     testBroadcast();
     testTrxBroadcast();
@@ -115,17 +123,27 @@ public class AdvServiceTest {
     Assert.assertNotNull(peer.getAdvInvSpread().getIfPresent(item));
   }
 
-  private void testTrxBroadcast() {
+  private void testTrxBroadcast() throws IOException {
     Protocol.Transaction trx = Protocol.Transaction.newBuilder()
         .setRawData(
         Protocol.Transaction.raw.newBuilder()
             .setRefBlockNum(1)
-            .setExpiration(System.currentTimeMillis() + 3000).build()).build();
+            .setExpiration(System.currentTimeMillis() + 3000).build())
+        .addRet(Protocol.Transaction.Result.newBuilder().setFee(123L).build())
+        .build();
     CommonParameter.getInstance().setValidContractProtoThreadNum(1);
     TransactionMessage msg = new TransactionMessage(trx);
     service.broadcast(msg);
     Item item = new Item(msg.getMessageId(), InventoryType.TRX);
-    Assert.assertNotNull(service.getMessage(item));
+    TransactionMessage cached = (TransactionMessage) service.getMessage(item);
+    Assert.assertNotNull(cached);
+    assertRelayPreservesOriginal(trx, msg, cached);
+
+    TransactionMessage fastMsg = new TransactionMessage(trx);
+    service.fastBroadcastTransaction(fastMsg);
+    TransactionMessage fastCached = (TransactionMessage) service.getMessage(item);
+    Assert.assertNotSame(cached, fastCached);
+    assertRelayPreservesOriginal(trx, fastMsg, fastCached);
 
     Protocol.Transaction expiredTrx = Protocol.Transaction.newBuilder()
         .setRawData(
@@ -138,6 +156,85 @@ public class AdvServiceTest {
     service.broadcast(msg);
     Item item1 = new Item(msg1.getMessageId(), InventoryType.TRX);
     Assert.assertNull(service.getMessage(item1));
+  }
+
+  private void assertRelayPreservesOriginal(Protocol.Transaction original,
+      TransactionMessage message, TransactionMessage cached) throws IOException {
+    Assert.assertNotNull(cached);
+    Assert.assertEquals(original, message.getTransactionCapsule().getInstance());
+    Assert.assertArrayEquals(original.toByteArray(), message.getData());
+    Assert.assertNotSame(message.getTransactionCapsule(), cached.getTransactionCapsule());
+    Protocol.Transaction relay = Protocol.Transaction.parseFrom(cached.getData());
+    Assert.assertEquals(0, relay.getRetCount());
+    Assert.assertEquals(original.getRawData(), relay.getRawData());
+    Assert.assertEquals(original.getSignatureList(), relay.getSignatureList());
+    Assert.assertEquals(relay, cached.getTransactionCapsule().getInstance());
+    Assert.assertEquals(message.getMessageId(), cached.getMessageId());
+  }
+
+  @Test
+  public void sameAddressPeersReceiveBroadcastAndDisconnectRetryIndependently() {
+    InetSocketAddress address = new InetSocketAddress("127.0.0.2", 10001);
+    Channel firstChannel = new Channel();
+    Channel secondChannel = new Channel();
+    ReflectUtils.setFieldValue(firstChannel, "inetSocketAddress", address);
+    ReflectUtils.setFieldValue(firstChannel, "inetAddress", address.getAddress());
+    ReflectUtils.setFieldValue(secondChannel, "inetSocketAddress", address);
+    ReflectUtils.setFieldValue(secondChannel, "inetAddress", address.getAddress());
+
+    List<Message> firstMessages = new ArrayList<>();
+    List<Message> secondMessages = new ArrayList<>();
+    PeerConnection first = new PeerConnection() {
+      @Override
+      public void sendMessage(Message message) {
+        firstMessages.add(message);
+      }
+    };
+    PeerConnection second = new PeerConnection() {
+      @Override
+      public void sendMessage(Message message) {
+        secondMessages.add(message);
+      }
+    };
+    first.setChannel(firstChannel);
+    second.setChannel(secondChannel);
+    Assert.assertEquals(firstChannel, secondChannel);
+    Assert.assertNotEquals(first, second);
+    first.setNeedSyncFromPeer(false);
+    first.setNeedSyncFromUs(false);
+    second.setNeedSyncFromPeer(false);
+    second.setNeedSyncFromUs(false);
+
+    TronNetDelegate delegate = mock(TronNetDelegate.class);
+    Mockito.when(delegate.getActivePeer()).thenReturn(Arrays.asList(first, second));
+    AdvService isolated = new AdvService();
+    ReflectUtils.setFieldValue(isolated, "tronNetDelegate", delegate);
+    try {
+      BlockCapsule block = new BlockCapsule(1, Sha256Hash.ZERO_HASH,
+          System.currentTimeMillis(), Sha256Hash.ZERO_HASH.getByteString());
+      isolated.broadcast(new BlockMessage(block));
+      Assert.assertEquals(1, firstMessages.size());
+      Assert.assertEquals(1, secondMessages.size());
+      Assert.assertTrue(firstMessages.get(0) instanceof InventoryMessage);
+      Assert.assertTrue(secondMessages.get(0) instanceof InventoryMessage);
+      Assert.assertEquals(Collections.singletonList(block.getBlockId()),
+          ((InventoryMessage) firstMessages.get(0)).getHashList());
+      Assert.assertEquals(Collections.singletonList(block.getBlockId()),
+          ((InventoryMessage) secondMessages.get(0)).getHashList());
+
+      Item item = new Item(Sha256Hash.ZERO_HASH, InventoryType.TRX);
+      first.getAdvInvRequest().put(item, System.currentTimeMillis());
+      second.getAdvInvReceive().put(item, System.currentTimeMillis());
+      isolated.onDisconnect(first);
+      Assert.assertTrue(second.getAdvInvRequest().containsKey(item));
+      Assert.assertEquals(1, firstMessages.size());
+      Assert.assertEquals(2, secondMessages.size());
+      Assert.assertTrue(secondMessages.get(1) instanceof FetchInvDataMessage);
+      Assert.assertEquals(Collections.singletonList(item.getHash()),
+          ((FetchInvDataMessage) secondMessages.get(1)).getHashList());
+    } finally {
+      isolated.close();
+    }
   }
 
 }

@@ -107,19 +107,23 @@ import org.tron.api.GrpcAPI.TransactionApprovedList;
 import org.tron.api.GrpcAPI.TransactionExtention;
 import org.tron.api.GrpcAPI.TransactionExtention.Builder;
 import org.tron.api.GrpcAPI.TransactionInfoList;
+import org.tron.api.GrpcAPI.TransactionSignWeight;
 import org.tron.api.GrpcAPI.WitnessList;
 import org.tron.common.crypto.Hash;
 import org.tron.common.crypto.SignInterface;
 import org.tron.common.crypto.SignUtils;
 import org.tron.common.crypto.pqc.PQAuthSigValidator;
+import org.tron.common.math.StrictMathWrapper;
 import org.tron.common.parameter.CommonParameter;
+import org.tron.common.prometheus.MetricKeys;
+import org.tron.common.prometheus.MetricLabels;
+import org.tron.common.prometheus.Metrics;
 import org.tron.common.runtime.ProgramResult;
 import org.tron.common.runtime.vm.LogInfo;
 import org.tron.common.utils.ByteArray;
 import org.tron.common.utils.ByteUtil;
 import org.tron.common.utils.DecodeUtil;
 import org.tron.common.utils.Sha256Hash;
-import org.tron.common.utils.StringUtil;
 import org.tron.common.utils.Utils;
 import org.tron.common.utils.WalletUtil;
 import org.tron.common.zksnark.IncrementalMerkleTreeContainer;
@@ -172,6 +176,7 @@ import org.tron.core.db2.core.Chainbase.Cursor;
 import org.tron.core.exception.AccountResourceInsufficientException;
 import org.tron.core.exception.BadItemException;
 import org.tron.core.exception.ContractExeException;
+import org.tron.core.exception.ContractSizeNotEqualToOneException;
 import org.tron.core.exception.ContractValidateException;
 import org.tron.core.exception.DupTransactionException;
 import org.tron.core.exception.HeaderNotFound;
@@ -239,6 +244,7 @@ import org.tron.protos.Protocol.Transaction;
 import org.tron.protos.Protocol.Transaction.Contract;
 import org.tron.protos.Protocol.Transaction.Contract.ContractType;
 import org.tron.protos.Protocol.Transaction.Result.code;
+import org.tron.protos.Protocol.Transaction.Result.contractResult;
 import org.tron.protos.Protocol.TransactionInfo;
 import org.tron.protos.contract.AssetIssueContractOuterClass.AssetIssueContract;
 import org.tron.protos.contract.BalanceContract;
@@ -264,9 +270,14 @@ public class Wallet {
       "Shielded transaction API is disabled; "
           + "set node.allowShieldedTransactionApi=true to enable.";
   private static final String PAYMENT_ADDRESS_FORMAT_WRONG = "paymentAddress format is wrong";
+  // the authoritative bound is checkBigIntegerRange: uint256 max is 78 decimal digits,
+  // this only keeps the string short enough to convert cheaply
+  private static final int MAX_SHIELDED_AMOUNT_LENGTH = 80;
   private static final String SHIELDED_TRANSACTION_SCAN_RANGE =
       "request requires start_block_index >= 0 && end_block_index > "
           + "start_block_index && end_block_index - start_block_index <= 1000";
+  // ABI: pos(32) + cm(32) + cv(32) + epk(32) + ciphertext bytes32[21](672)
+  private static final int SHIELDED_TRC20_NOTE_LOG_SIZE = 800;
   private static String addressPreFixString = Constant.ADD_PRE_FIX_STRING_MAINNET;//default testnet
   private static final byte[] SHIELDED_TRC20_LOG_TOPICS_MINT = Hash.sha3(ByteArray.fromString(
       "MintNewLeaf(uint256,bytes32,bytes32,bytes32,bytes32[21])"));
@@ -303,8 +314,7 @@ public class Wallet {
    * Creates a new Wallet with a random ECKey.
    */
   public Wallet() {
-    this.cryptoEngine = SignUtils.getGeneratedRandomSign(Utils.getRandom(),
-            CommonParameter.getInstance().isECKeyCryptoEngine());
+    this.cryptoEngine = SignUtils.getGeneratedRandomSign(Utils.getRandom());
   }
 
   /**
@@ -526,8 +536,11 @@ public class Wallet {
 
       for (ByteString sig : signedTransaction.getSignatureList()) {
         if (!SignUtils.isValidLength(sig.size())) {
+          Metrics.counterInc(MetricKeys.Counter.TX_REJECT, 1,
+              MetricLabels.Counter.TX_REJECT_API,
+              MetricLabels.Counter.TX_REJECT_INVALID_SIGNATURE_LENGTH);
           String info = "Signature size is " + sig.size();
-          logger.warn(BROADCAST_TRANS_FAILED, txID, info);
+          logger.debug("Broadcast transaction {} has failed, {}.", txID, info);
           return builder.setResult(false).setCode(response_code.SIGERROR)
               .setMessage(ByteString.copyFromUtf8("Validate signature error: " + info))
               .build();
@@ -607,11 +620,23 @@ public class Wallet {
       if (chainBaseManager.getDynamicPropertiesStore().supportVM()) {
         trx.resetResult();
       }
-      if (trx.getInstance().getRawData().getContractCount() == 0) {
+      int contractCount = trx.getInstance().getRawData().getContractCount();
+      if (contractCount == 0) {
         throw new ContractValidateException(ActuatorConstant.CONTRACT_NOT_EXIST);
       }
+      if (contractCount > 1) {
+        throw new ContractSizeNotEqualToOneException(String.format(
+            "tx %s " + ActuatorConstant.CONTRACT_SIZE_NOT_EQUAL_TO_ONE, txID, contractCount));
+      }
       trx.checkExpiration(chainBaseManager.getNextBlockSlotTime());
-      dbManager.pushTransaction(trx);
+      if (!dbManager.pushTransaction(trx)) {
+        logger.debug("Broadcast transaction {} has failed, transaction was rejected locally.",
+            txID);
+        return builder.setResult(false).setCode(response_code.SERVER_BUSY)
+            .setMessage(ByteString.copyFromUtf8(
+                "Transaction was rejected locally."))
+            .build();
+      }
       TransactionMessage message = new TransactionMessage(trx.getInstance().toByteArray());
       int num = tronNetService.fastBroadcastTransaction(message);
       if (num == 0 && minEffectiveConnection != 0) {
@@ -668,11 +693,132 @@ public class Wallet {
     }
   }
 
+  /**
+   * Applies the API query length policy independently of proposal activation, without rewriting.
+   * Consensus validation must use its proposal-controlled checks instead.
+   */
+  private static void validateSignatureLengths(Transaction trx) throws SignatureFormatException {
+    for (ByteString sig : trx.getSignatureList()) {
+      if (!SignUtils.isValidLength(sig.size())) {
+        throw new SignatureFormatException("Signature size is " + sig.size());
+      }
+    }
+  }
+
+  public TransactionSignWeight getTransactionSignWeight(Transaction trx) {
+    TransactionSignWeight.Builder tswBuilder = TransactionSignWeight.newBuilder();
+    TransactionSignWeight.Result.Builder resultBuilder = TransactionSignWeight.Result.newBuilder();
+    int contractCount = trx.getRawData().getContractCount();
+    if (contractCount > 1) {
+      resultBuilder.setCode(TransactionSignWeight.Result.response_code.OTHER_ERROR);
+      resultBuilder.setMessage("Invalid transaction: "
+          + String.format(ActuatorConstant.CONTRACT_SIZE_NOT_EQUAL_TO_ONE, contractCount));
+      tswBuilder.setResult(resultBuilder);
+      return tswBuilder.build();
+    }
+    if (new TransactionCapsule(trx).getTotalSignatureCount()
+        > chainBaseManager.getDynamicPropertiesStore().getTotalSignNum()) {
+      resultBuilder.setCode(TransactionSignWeight.Result.response_code.OTHER_ERROR);
+      resultBuilder.setMessage("too many signatures");
+      tswBuilder.setResult(resultBuilder);
+      return tswBuilder.build();
+    }
+
+    try {
+      validateSignatureLengths(trx);
+    } catch (SignatureFormatException e) {
+      return tswBuilder.setResult(resultBuilder
+          .setCode(TransactionSignWeight.Result.response_code.SIGNATURE_FORMAT_ERROR)
+          .setMessage(e.getMessage())).build();
+    }
+
+    TransactionExtention.Builder trxExBuilder = TransactionExtention.newBuilder();
+    trxExBuilder.setTransaction(trx);
+    trxExBuilder.setTxid(ByteString.copyFrom(Sha256Hash.hash(trx.getRawData().toByteArray())));
+    Return.Builder retBuilder = Return.newBuilder();
+    retBuilder.setResult(true).setCode(response_code.SUCCESS);
+    trxExBuilder.setResult(retBuilder);
+    tswBuilder.setTransaction(trxExBuilder);
+
+    if (trx.getRawData().getContractCount() == 0) {
+      resultBuilder.setCode(TransactionSignWeight.Result.response_code.OTHER_ERROR);
+      resultBuilder.setMessage("Invalid transaction: no valid contract");
+    } else {
+      try {
+        Contract contract = trx.getRawData().getContract(0);
+        byte[] owner = TransactionCapsule.getOwner(contract);
+        AccountCapsule account = chainBaseManager.getAccountStore().get(owner);
+        if (Objects.isNull(account)) {
+          throw new PermissionException("Account does not exist!");
+        }
+        int permissionId = contract.getPermissionId();
+        Permission permission = account.getPermissionById(permissionId);
+        if (permission == null) {
+          throw new PermissionException("Permission for this, does not exist!");
+        }
+        if (permissionId != 0) {
+          if (permission.getType() != PermissionType.Active) {
+            throw new PermissionException("Permission type is wrong!");
+          }
+          //check operations
+          if (!TransactionUtil.checkPermissionOperations(permission, contract)) {
+            throw new PermissionException("Permission denied!");
+          }
+        }
+        tswBuilder.setPermission(permission);
+        List<ByteString> approveList = new ArrayList<>();
+        long currentWeight = 0L;
+        if (trx.getSignatureCount() > 0) {
+          currentWeight = TransactionCapsule.checkWeight(permission, trx.getSignatureList(),
+              Sha256Hash.hash(trx.getRawData().toByteArray()), approveList, true);
+        }
+        if (trx.getPqAuthSigCount() > 0) {
+          try {
+            long pqWeight = TransactionCapsule.validatePQSignatureGetWeight(trx, permission,
+                chainBaseManager.getDynamicPropertiesStore(), approveList);
+            currentWeight = StrictMathWrapper.addExact(currentWeight, pqWeight);
+          } catch (ArithmeticException e) {
+            throw new PermissionException("weight overflow");
+          }
+        }
+        tswBuilder.addAllApprovedList(approveList);
+        tswBuilder.setCurrentWeight(currentWeight);
+        if (tswBuilder.getCurrentWeight() >= permission.getThreshold()) {
+          resultBuilder.setCode(TransactionSignWeight.Result.response_code.ENOUGH_PERMISSION);
+        } else {
+          resultBuilder.setCode(TransactionSignWeight.Result.response_code.NOT_ENOUGH_PERMISSION);
+        }
+      } catch (SignatureFormatException signEx) {
+        resultBuilder.setCode(TransactionSignWeight.Result.response_code.SIGNATURE_FORMAT_ERROR);
+        resultBuilder.setMessage(signEx.getMessage());
+      } catch (SignatureException signEx) {
+        resultBuilder.setCode(TransactionSignWeight.Result.response_code.COMPUTE_ADDRESS_ERROR);
+        resultBuilder.setMessage(signEx.getMessage());
+      } catch (PermissionException permEx) {
+        resultBuilder.setCode(TransactionSignWeight.Result.response_code.PERMISSION_ERROR);
+        resultBuilder.setMessage(permEx.getMessage());
+      } catch (Exception ex) {
+        resultBuilder.setCode(TransactionSignWeight.Result.response_code.OTHER_ERROR);
+        resultBuilder.setMessage(ex.getClass() + " : " + ex.getMessage());
+      }
+    }
+
+    tswBuilder.setResult(resultBuilder);
+    return tswBuilder.build();
+  }
+
   public TransactionApprovedList getTransactionApprovedList(Transaction trx) {
     TransactionApprovedList.Builder tswBuilder = TransactionApprovedList.newBuilder();
     TransactionApprovedList.Result.Builder resultBuilder = TransactionApprovedList.Result
         .newBuilder();
-
+    int contractCount = trx.getRawData().getContractCount();
+    if (contractCount > 1) {
+      resultBuilder.setCode(TransactionApprovedList.Result.response_code.OTHER_ERROR);
+      resultBuilder.setMessage("Invalid transaction: "
+          + String.format(ActuatorConstant.CONTRACT_SIZE_NOT_EQUAL_TO_ONE, contractCount));
+      tswBuilder.setResult(resultBuilder);
+      return tswBuilder.build();
+    }
     TransactionCapsule trxCap = new TransactionCapsule(trx);
     if (trxCap.getTotalSignatureCount()
         > chainBaseManager.getDynamicPropertiesStore().getTotalSignNum()) {
@@ -682,11 +828,17 @@ public class Wallet {
       return tswBuilder.build();
     }
 
-    trx = TransactionUtil.truncateSignatures(trx);
+    try {
+      validateSignatureLengths(trx);
+    } catch (SignatureFormatException e) {
+      return tswBuilder.setResult(resultBuilder
+          .setCode(TransactionApprovedList.Result.response_code.SIGNATURE_FORMAT_ERROR)
+          .setMessage(e.getMessage())).build();
+    }
+
     TransactionExtention.Builder trxExBuilder = TransactionExtention.newBuilder();
     trxExBuilder.setTransaction(trx);
-    trxExBuilder.setTxid(ByteString.copyFrom(Sha256Hash.hash(CommonParameter
-        .getInstance().isECKeyCryptoEngine(), trx.getRawData().toByteArray())));
+    trxExBuilder.setTxid(ByteString.copyFrom(Sha256Hash.hash(trx.getRawData().toByteArray())));
     Return.Builder retBuilder = Return.newBuilder();
     retBuilder.setResult(true).setCode(response_code.SUCCESS);
     trxExBuilder.setResult(retBuilder);
@@ -720,9 +872,9 @@ public class Wallet {
 
         List<ByteString> approveList = new ArrayList<>();
         if (trx.getSignatureCount() > 0) {
-          byte[] hash = Sha256Hash.hash(CommonParameter
-              .getInstance().isECKeyCryptoEngine(), trx.getRawData().toByteArray());
-          TransactionCapsule.checkWeight(permission, trx.getSignatureList(), hash, approveList);
+          byte[] hash = Sha256Hash.hash(trx.getRawData().toByteArray());
+          TransactionCapsule.checkWeight(permission, trx.getSignatureList(), hash,
+              approveList, true);
         }
         if (trx.getPqAuthSigCount() > 0) {
           TransactionCapsule.validatePQSignatureGetWeight(trx, permission,
@@ -780,6 +932,18 @@ public class Wallet {
 
   public long getHeadBlockNum() {
     return chainBaseManager.getHeadBlockNum();
+  }
+
+  public boolean isLiteNode() {
+    return chainBaseManager.isLiteNode();
+  }
+
+  public long getLowestBlockNum() {
+    return chainBaseManager.getLowestBlockNum();
+  }
+
+  public long getLowestBlockNumOfReceiptStore() {
+    return chainBaseManager.getLowestBlockNumOfReceiptStore();
   }
 
   public BlockCapsule getBlockCapsuleByNum(long blockNum) {
@@ -1594,6 +1758,16 @@ public class Wallet {
     builder.addChainParameter(Protocol.ChainParameters.ChainParameter.newBuilder()
         .setKey("getAllowOptimizeTvmStorage")
         .setValue(dbManager.getDynamicPropertiesStore().getAllowOptimizeTvmStorage())
+        .build());
+
+    builder.addChainParameter(Protocol.ChainParameters.ChainParameter.newBuilder()
+        .setKey("getAllowStrictEcdsaValidation")
+        .setValue(dbManager.getDynamicPropertiesStore().getAllowStrictEcdsaValidation())
+        .build());
+
+    builder.addChainParameter(Protocol.ChainParameters.ChainParameter.newBuilder()
+        .setKey("getCloseExchange")
+        .setValue(dbManager.getDynamicPropertiesStore().getCloseExchange())
         .build());
 
     builder.addChainParameter(Protocol.ChainParameters.ChainParameter.newBuilder()
@@ -2834,6 +3008,10 @@ public class Wallet {
     if (contract == null || contract.isEmpty()) {
       throw new ContractValidateException("Contract is null");
     }
+    if (contract.size() > 1) {
+      throw new ContractValidateException(
+          String.format(ActuatorConstant.CONTRACT_SIZE_NOT_EQUAL_TO_ONE, contract.size()));
+    }
     ContractType contractType = contract.get(0).getType();
     if (contractType != ContractType.ShieldedTransferContract) {
       throw new ContractValidateException("Not a shielded transaction");
@@ -3269,6 +3447,7 @@ public class Wallet {
     }
     if (result.isRevert()) {
       ret.setStatus(0, code.FAILED);
+      ret.setResultCode(contractResult.REVERT);
       retBuilder.setMessage(ByteString.copyFromUtf8("REVERT opcode executed"))
           .build();
     }
@@ -3282,7 +3461,7 @@ public class Wallet {
     if (accountCapsule == null) {
       logger.warn(
           "Get contract failed, the account {} does not exist or the account "
-              + "does not have a code hash!", StringUtil.encode58Check(address));
+              + "does not have a code hash!", WalletUtil.getAddressString(address));
       return null;
     }
 
@@ -3311,7 +3490,7 @@ public class Wallet {
     if (accountCapsule == null) {
       logger.warn(
           "Get contract failed, the account {} does not exist or the account does not have a code "
-              + "hash!", StringUtil.encode58Check(address));
+              + "hash!", WalletUtil.getAddressString(address));
       return null;
     }
 
@@ -3959,7 +4138,7 @@ public class Wallet {
       int logType)
       throws ZksnarkException, ContractExeException {
     byte[] logData = log.getData().toByteArray();
-    if (!ArrayUtils.isEmpty(logData) && logType > 0 && logType < 4) {
+    if (logData.length == SHIELDED_TRC20_NOTE_LOG_SIZE && logType > 0 && logType < 4) {
       // Data = pos(32) + cm(32) + cv(32) + epk(32) + c_enc(580) + c_out(80)
       long pos = ByteArray.toLong(ByteArray.subArray(logData, 0, 32));
       byte[] cm = ByteArray.subArray(logData, 32, 64);
@@ -4116,84 +4295,82 @@ public class Wallet {
       TransactionInfo.Log log, byte[] ovk, int logType, byte[] pendingNf)
       throws ZksnarkException {
     byte[] logData = log.getData().toByteArray();
-    if (!ArrayUtils.isEmpty(logData)) {
-      if (logType > 0 && logType < 4) {
-        //Data = pos(32) + cm(32) + cv(32) + epk(32) + c_enc(580) + c_out(80)
-        byte[] cm = ByteArray.subArray(logData, 32, 64);
-        byte[] cv = ByteArray.subArray(logData, 64, 96);
-        byte[] epk = ByteArray.subArray(logData, 96, 128);
-        byte[] cenc = ByteArray.subArray(logData, 128, 708);
-        byte[] coutText = ByteArray.subArray(logData, 708, 788);
-        Encryption.OutCiphertext cout = new Encryption.OutCiphertext();
-        cout.setData(coutText);
-        Optional<OutgoingPlaintext> notePlaintext = OutgoingPlaintext.decrypt(cout,//ciphertext
-            ovk, cv, cm, epk);
-        if (notePlaintext.isPresent()) {
-          OutgoingPlaintext decryptedOutCtUnwrapped = notePlaintext.get();
-          //decode c_enc with pkd、esk
-          Encryption.EncCiphertext ciphertext = new Encryption.EncCiphertext();
-          ciphertext.setData(cenc);
-          Optional<Note> foo = Note.decrypt(ciphertext,
-              epk,
-              decryptedOutCtUnwrapped.getEsk(),
-              decryptedOutCtUnwrapped.getPkD(),
-              cm);
-          if (foo.isPresent()) {
-            Note bar = foo.get();
-            String paymentAddress = KeyIo.encodePaymentAddress(
-                new PaymentAddress(bar.getD(), decryptedOutCtUnwrapped.getPkD()));
-            GrpcAPI.Note note = GrpcAPI.Note.newBuilder()
-                .setPaymentAddress(paymentAddress)
-                .setValue(bar.getValue())
-                .setRcm(ByteString.copyFrom(bar.getRcm()))
-                .setMemo(ByteString.copyFrom(stripRightZero(bar.getMemo())))
-                .build();
-            builder.setNote(note);
-            return Optional.of(builder.build());
-          }
+    if (logData.length == SHIELDED_TRC20_NOTE_LOG_SIZE && logType > 0 && logType < 4) {
+      // Data = pos(32) + cm(32) + cv(32) + epk(32) + c_enc(580) + c_out(80)
+      byte[] cm = ByteArray.subArray(logData, 32, 64);
+      byte[] cv = ByteArray.subArray(logData, 64, 96);
+      byte[] epk = ByteArray.subArray(logData, 96, 128);
+      byte[] cenc = ByteArray.subArray(logData, 128, 708);
+      byte[] coutText = ByteArray.subArray(logData, 708, 788);
+      Encryption.OutCiphertext cout = new Encryption.OutCiphertext();
+      cout.setData(coutText);
+      Optional<OutgoingPlaintext> notePlaintext = OutgoingPlaintext.decrypt(cout,//ciphertext
+          ovk, cv, cm, epk);
+      if (notePlaintext.isPresent()) {
+        OutgoingPlaintext decryptedOutCtUnwrapped = notePlaintext.get();
+        //decode c_enc with pkd、esk
+        Encryption.EncCiphertext ciphertext = new Encryption.EncCiphertext();
+        ciphertext.setData(cenc);
+        Optional<Note> foo = Note.decrypt(ciphertext,
+            epk,
+            decryptedOutCtUnwrapped.getEsk(),
+            decryptedOutCtUnwrapped.getPkD(),
+            cm);
+        if (foo.isPresent()) {
+          Note bar = foo.get();
+          String paymentAddress = KeyIo.encodePaymentAddress(
+              new PaymentAddress(bar.getD(), decryptedOutCtUnwrapped.getPkD()));
+          GrpcAPI.Note note = GrpcAPI.Note.newBuilder()
+              .setPaymentAddress(paymentAddress)
+              .setValue(bar.getValue())
+              .setRcm(ByteString.copyFrom(bar.getRcm()))
+              .setMemo(ByteString.copyFrom(stripRightZero(bar.getMemo())))
+              .build();
+          builder.setNote(note);
+          return Optional.of(builder.build());
         }
-      } else if (logType == 4) {
-        // Data = toAddress(32) + value(32) + cipher(80) + nonce(12) + reserved/version(4)
-        if (logData.length < 64 + NoteEncryption.Encryption.BURN_CIPHER_RECORD_SIZE) {
+      }
+    } else if (logType == 4) {
+      // Data = toAddress(32) + value(32) + cipher(80) + nonce(12) + reserved/version(4)
+      if (logData.length != 64 + NoteEncryption.Encryption.BURN_CIPHER_RECORD_SIZE) {
+        return Optional.empty();
+      }
+      byte[] logToAddress = ByteArray.subArray(logData, 12, 32);
+      byte[] logAmountArray = ByteArray.subArray(logData, 32, 64);
+      byte[] cipher = ByteArray.subArray(logData, 64, 144);
+      byte[] nonceFromLog = ByteArray.subArray(logData, 144,
+          144 + NoteEncryption.Encryption.BURN_NONCE_LEN);
+      byte[] reservedFromLog = ByteArray.subArray(logData,
+          144 + NoteEncryption.Encryption.BURN_NONCE_LEN,
+          144 + NoteEncryption.Encryption.BURN_NONCE_LEN
+              + NoteEncryption.Encryption.BURN_RESERVED_LEN);
+      BigInteger logAmount = ByteUtil.bytesToBigInteger(logAmountArray);
+      byte[] plaintext;
+      byte[] amountArray = new byte[32];
+      byte[] decryptedAddress = new byte[20];
+
+      byte[] addr21FromLog = new byte[21];
+      addr21FromLog[0] = Wallet.getAddressPreFixByte();
+      System.arraycopy(logToAddress, 0, addr21FromLog, 1, 20);
+      Optional<byte[]> decryptedText = NoteEncryption.Encryption
+          .decryptBurnMessageByOvk(ovk, cipher, nonceFromLog, reservedFromLog, pendingNf,
+              logAmountArray, addr21FromLog);
+
+      if (decryptedText.isPresent()) {
+        plaintext = decryptedText.get();
+        if (plaintext[32] != Wallet.getAddressPreFixByte()) {
           return Optional.empty();
         }
-        byte[] logToAddress = ByteArray.subArray(logData, 12, 32);
-        byte[] logAmountArray = ByteArray.subArray(logData, 32, 64);
-        byte[] cipher = ByteArray.subArray(logData, 64, 144);
-        byte[] nonceFromLog = ByteArray.subArray(logData, 144,
-            144 + NoteEncryption.Encryption.BURN_NONCE_LEN);
-        byte[] reservedFromLog = ByteArray.subArray(logData,
-            144 + NoteEncryption.Encryption.BURN_NONCE_LEN,
-            144 + NoteEncryption.Encryption.BURN_NONCE_LEN
-                + NoteEncryption.Encryption.BURN_RESERVED_LEN);
-        BigInteger logAmount = ByteUtil.bytesToBigInteger(logAmountArray);
-        byte[] plaintext;
-        byte[] amountArray = new byte[32];
-        byte[] decryptedAddress = new byte[20];
-
-        byte[] addr21FromLog = new byte[21];
-        addr21FromLog[0] = Wallet.getAddressPreFixByte();
-        System.arraycopy(logToAddress, 0, addr21FromLog, 1, 20);
-        Optional<byte[]> decryptedText = NoteEncryption.Encryption
-            .decryptBurnMessageByOvk(ovk, cipher, nonceFromLog, reservedFromLog, pendingNf,
-                logAmountArray, addr21FromLog);
-
-        if (decryptedText.isPresent()) {
-          plaintext = decryptedText.get();
-          if (plaintext[32] != Wallet.getAddressPreFixByte()) {
-            return Optional.empty();
-          }
-          System.arraycopy(plaintext, 0, amountArray, 0, 32);
-          System.arraycopy(plaintext, 33, decryptedAddress, 0, 20);
-          BigInteger decryptedAmount = ByteUtil.bytesToBigInteger(amountArray);
-          if (logAmount.equals(decryptedAmount) && Hex.toHexString(logToAddress)
-              .equals(Hex.toHexString(decryptedAddress))) {
-            byte[] addressWithPrefix = new byte[21];
-            System.arraycopy(plaintext, 32, addressWithPrefix, 0, 21);
-            builder.setToAmount(logAmount.toString(10))
-                .setTransparentToAddress(ByteString.copyFrom(addressWithPrefix));
-            return Optional.of(builder.build());
-          }
+        System.arraycopy(plaintext, 0, amountArray, 0, 32);
+        System.arraycopy(plaintext, 33, decryptedAddress, 0, 20);
+        BigInteger decryptedAmount = ByteUtil.bytesToBigInteger(amountArray);
+        if (logAmount.equals(decryptedAmount) && Hex.toHexString(logToAddress)
+            .equals(Hex.toHexString(decryptedAddress))) {
+          byte[] addressWithPrefix = new byte[21];
+          System.arraycopy(plaintext, 32, addressWithPrefix, 0, 21);
+          builder.setToAmount(logAmount.toString(10))
+              .setTransparentToAddress(ByteString.copyFrom(addressWithPrefix));
+          return Optional.of(builder.build());
         }
       }
     }
@@ -4227,9 +4404,7 @@ public class Wallet {
               int logType = getShieldedTRC20LogType(log, shieldedTRC20ContractAddress);
               if (logType == 5) {
                 byte[] logData = log.getData().toByteArray();
-                if (logData.length >= 32) {
-                  pendingNf = ByteArray.subArray(logData, 0, 32);
-                }
+                pendingNf = logData.length == 32 ? logData : null;
               } else if (logType > 0) {
                 noteBuilder = DecryptNotesTRC20.NoteTx.newBuilder();
                 noteBuilder.setTxid(ByteString.copyFrom(txid));
@@ -4290,6 +4465,9 @@ public class Wallet {
     String trimmedIn = in.trim();
     if (trimmedIn.length() == 0) {
       return BigInteger.ZERO;
+    }
+    if (trimmedIn.length() > MAX_SHIELDED_AMOUNT_LENGTH) {
+      throw new IllegalArgumentException("invalid shielded amount");
     }
     return new BigInteger(trimmedIn, 10);
   }
@@ -4402,7 +4580,12 @@ public class Wallet {
 
     ShieldedTRC20Parameters shieldedTRC20Parameters = request.getShieldedTRC20Parameters();
     List<BytesMessage> spendAuthoritySignature = request.getSpendAuthoritySignatureList();
-    BigInteger value = getBigIntegerFromString(request.getAmount());
+    BigInteger value;
+    try {
+      value = getBigIntegerFromString(request.getAmount());
+    } catch (IllegalArgumentException e) {
+      throw new ContractValidateException("invalid amount", e);
+    }
     checkBigIntegerRange(value);
     byte[] transparentToAddress = request.getTransparentToAddress().toByteArray();
     byte[] transparentToAddressTvm = new byte[20];
@@ -4467,9 +4650,16 @@ public class Wallet {
       }
       parametersBuilder.setBurnCiphertext(burnCiper);
     }
-    String input = parametersBuilder
-        .getTriggerContractInput(shieldedTRC20Parameters, spendAuthoritySignature, value, false,
-            transparentToAddressTvm);
+    String input;
+    try {
+      input = parametersBuilder
+          .getTriggerContractInput(shieldedTRC20Parameters, spendAuthoritySignature, value, false,
+              transparentToAddressTvm);
+    } catch (IllegalArgumentException e) {
+      // the builder names the offending argument in fixed strings; none of them echoes an input
+      throw new ContractValidateException(
+          "invalid shielded TRC-20 trigger input: " + e.getMessage(), e);
+    }
     if (Objects.isNull(input)) {
       throw new ZksnarkException("generate the trigger contract parameters error");
     }
@@ -4604,8 +4794,7 @@ public class Wallet {
     List<String> localWitnessAddresses = new ArrayList<>();
     for (String privateKey : localPrivateKeys) {
       localWitnessAddresses.add(Hex.toHexString(SignUtils
-          .fromPrivate(ByteArray.fromHexString(privateKey),
-              CommonParameter.getInstance().isECKeyCryptoEngine()).getAddress()));
+          .fromPrivate(ByteArray.fromHexString(privateKey)).getAddress()));
     }
 
     // get all witnesses
@@ -4635,8 +4824,7 @@ public class Wallet {
     List<String> localWitnessAddresses = new ArrayList<>();
     for (String privateKey : localPrivateKeys) {
       localWitnessAddresses.add(Hex.toHexString(SignUtils
-          .fromPrivate(ByteArray.fromHexString(privateKey),
-              CommonParameter.getInstance().isECKeyCryptoEngine()).getAddress()));
+          .fromPrivate(ByteArray.fromHexString(privateKey)).getAddress()));
     }
 
     // get active witnesses

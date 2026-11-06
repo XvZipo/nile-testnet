@@ -98,6 +98,20 @@ public class VMConfigIsolationTest {
     assertTrue(VMConfig.allowOptimizeTvmStorageKey());
   }
 
+  @Test
+  public void testSnapshotGlobalPreservesGovernanceFlags() {
+    VMConfig.initAllowOptimizeTvmStorageKey(1);
+    VMConfig.initAllowStrictEcdsaValidation(1);
+    VMConfig.Snapshot snapshot = snapshotGlobal();
+
+    VMConfig.initAllowOptimizeTvmStorageKey(0);
+    VMConfig.initAllowStrictEcdsaValidation(0);
+    VMConfig.setGlobalSnapshot(snapshot);
+
+    assertTrue(VMConfig.allowOptimizeTvmStorageKey());
+    assertTrue(VMConfig.allowStrictEcdsaValidation());
+  }
+
   // Deep-copy the current global config through the public getters (no thread-local set here, so
   // the getters read the global) so @After can restore the exact prior state.
   private static VMConfig.Snapshot snapshotGlobal() {
@@ -130,6 +144,7 @@ public class VMConfigIsolationTest {
     snapshot.allowHardenResourceCalculation = VMConfig.allowHardenResourceCalculation();
     snapshot.allowFnDsa512 = VMConfig.allowFnDsa512();
     snapshot.allowMlDsa44 = VMConfig.allowMlDsa44();
+    snapshot.allowStrictEcdsaValidation = VMConfig.allowStrictEcdsaValidation();
     snapshot.allowOptimizeTvmStorageKey = VMConfig.allowOptimizeTvmStorageKey();
     return snapshot;
   }
